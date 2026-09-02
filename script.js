@@ -84,7 +84,14 @@ const $ = id => document.getElementById(id);
 const genId = () => Date.now() + Math.random();
 
 function getDoc(id) { return docs.find(d => d.id === id); }
-function saveAll() { try { localStorage.setItem('prose-docs', JSON.stringify(docs)); } catch(e) {} }
+function saveAll() {
+  try {
+    localStorage.setItem('prose-docs', JSON.stringify(docs));
+  } catch(e) {
+    console.error('Save failed:', e);
+    showSaveToast('⚠ Save failed — storage full?');
+  }
+}
 
 function markUnsaved() {
   const t = i18n[currentLang];
@@ -135,12 +142,118 @@ updateTime();
 function looksLikeCode(text) {
   if (!text || !text.trim()) return false;
   const t = text.trim();
+  // JS/general-programming style
   if (/^\s{2,}/.test(text)) return true;
   if (/[{}\[\]();]/.test(t)) return true;
   if (/^(const|let|var|function|class|import|export|return|if|for|while|def|fn|pub|use)\b/.test(t)) return true;
   if (/^\s*(\/\/|\/\*|#|<!--)/.test(text)) return true;
   if (/=>|===|!==|&&|\|\|/.test(t)) return true;
+  // HTML/XML — line starts with a tag, e.g. <link ...>, </div>, <svg ...>
+  if (/^<\/?[a-zA-Z!][\w:-]*(\s[^<>]*)?\/?>?/.test(t)) return true;
+  // A tag with a quoted attribute appearing anywhere in the line
+  if (/<[a-zA-Z][^<>]*=["'][^"']*["'][^<>]*>/.test(t)) return true;
+  // CSS-style "property: value;"
+  if (/^[a-zA-Z-]+\s*:\s*[^;]+;\s*$/.test(t)) return true;
+  // Fallback: dense use of code/markup symbols (<, >, =, ", /) relative to
+  // line length — catches long attribute-heavy lines even if the above
+  // specific patterns miss some edge case.
+  const symbolCount = (t.match(/[<>="\/]/g) || []).length;
+  if (t.length > 15 && symbolCount / t.length > 0.12) return true;
   return false;
+}
+
+// Decides whether a whole chunk of text (one or more lines) reads like
+// source code rather than normal prose, by checking what share of its
+// lines individually look code-like. A single pasted code line (1/1)
+// still counts; a normal paragraph that happens to contain one bracket
+// won't false-positive because most of its lines won't match.
+function textLooksLikeCode(text) {
+  if (!text || !text.trim()) return false;
+  const lines = text.split('\n').filter(l => l.trim() !== '');
+  if (lines.length === 0) return false;
+  const codeLineCount = lines.filter(looksLikeCode).length;
+  return (codeLineCount / lines.length) >= 0.4;
+}
+
+// A line "has content" (and should get a highlighted number) if it has
+// text OR contains an image — an image-only line still counts.
+function blockHasContent(block) {
+  if ((block.innerText || '').trim() !== '') return true;
+  if (block.classList && block.classList.contains('img-wrapper')) return true;
+  if (block.querySelector && block.querySelector('img, .img-wrapper')) return true;
+  return false;
+}
+
+// Finds which <li> (direct child of a <ul>/<ol>) currently holds the caret,
+// so that specific list item's gutter number can be marked active.
+function getCaretLi(listBlock) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  let node = sel.getRangeAt(0).startContainer;
+  while (node && node !== listBlock) {
+    if (node.parentNode === listBlock) return node;
+    node = node.parentNode;
+  }
+  return null;
+}
+
+// The browser often merges a multi-line selection into ONE <li> with <br>
+// tags between the lines instead of one <li> per line. Split any such <li>
+// back into separate <li> elements — one per line — so each line gets its
+// own gutter number, in order, with nothing missing.
+function splitListItemsByBr(listEl) {
+  Array.from(listEl.children).forEach(li => {
+    if (li.tagName !== 'LI' || !li.querySelector('br')) return;
+    const lines = [document.createDocumentFragment()];
+    Array.from(li.childNodes).forEach(node => {
+      if (node.nodeName === 'BR') lines.push(document.createDocumentFragment());
+      else lines[lines.length - 1].appendChild(node.cloneNode(true));
+    });
+    lines.forEach(frag => {
+      const newLi = document.createElement('li');
+      newLi.appendChild(frag);
+      listEl.insertBefore(newLi, li);
+    });
+    listEl.removeChild(li);
+  });
+}
+
+// Splits a regular (non-list) top-level block that contains <br> tags
+// back into separate sibling blocks — one per line. This happens when
+// toggling list formatting OFF: the browser often merges the un-listed
+// lines into a single <div> with <br>s instead of separate lines, which
+// is what makes the gutter numbers vanish/collapse after removing a list.
+function splitBrSeparatedBlock(block) {
+  if (block.classList && block.classList.contains('img-wrapper')) return;
+  if (!block.querySelector || !block.querySelector('br')) return;
+
+  const tagName = block.tagName ? block.tagName.toLowerCase() : 'div';
+  const lines = [document.createDocumentFragment()];
+  Array.from(block.childNodes).forEach(node => {
+    if (node.nodeName === 'BR') lines.push(document.createDocumentFragment());
+    else lines[lines.length - 1].appendChild(node.cloneNode(true));
+  });
+  lines.forEach(frag => {
+    const newBlock = document.createElement(tagName);
+    if (block.style && block.style.cssText) newBlock.style.cssText = block.style.cssText;
+    newBlock.appendChild(frag);
+    editor.insertBefore(newBlock, block);
+  });
+  editor.removeChild(block);
+}
+
+// Runs after ANY list-toggle (on or off) to guarantee every visual line
+// is its own top-level block/li, so gutter numbers stay visible and in
+// the correct order no matter which direction the toggle went.
+function normalizeLists() {
+  Array.from(editor.children).forEach(block => {
+    if (block.tagName === 'UL' || block.tagName === 'OL') {
+      splitListItemsByBr(block);
+    } else {
+      splitBrSeparatedBlock(block);
+    }
+  });
+  scheduleGutterUpdate();
 }
 
 let gutterUpdateTimer = null;
@@ -178,7 +291,6 @@ editor.addEventListener('focus', updateActiveLineHighlight);
 
 function updateGutter() {
   const gutterRect = gutter.getBoundingClientRect();
-  const editorAreaRect = document.getElementById('editor-area').getBoundingClientRect();
   gutter.innerHTML = '';
   gutter.style.minHeight = paper.offsetHeight + 'px';
 
@@ -191,7 +303,6 @@ function updateGutter() {
     const cs = getComputedStyle(editor);
     const fontSize = parseFloat(cs.fontSize) || 16;
     const lineH = parseFloat(cs.lineHeight) || fontSize * 1.8;
-    // top relative to gutter top (both inside the same scroll container)
     const top = editorRect.top - gutterRect.top;
     const el = document.createElement('div');
     el.className = 'gutter-line active-line';
@@ -203,32 +314,62 @@ function updateGutter() {
   }
 
   let lineNum = 1;
-  blocks.forEach(block => {
-    const blockRect = block.getBoundingClientRect();
-    const top = blockRect.top - gutterRect.top;
 
-    // Get accurate line height from the block itself
-    const cs = getComputedStyle(block);
+  // Creates one visible, correctly-styled gutter number for a given
+  // block/li element and advances lineNum by however many visual lines
+  // that element actually takes up.
+  function addGutterLine(target, isActive) {
+    const rect = target.getBoundingClientRect();
+    const top = rect.top - gutterRect.top;
+    const cs = getComputedStyle(target);
     const fontSize = parseFloat(cs.fontSize) || 16;
     let lineH = parseFloat(cs.lineHeight);
-    // If lineHeight is 'normal' (NaN), approximate from font-size
     if (isNaN(lineH) || lineH <= 0) lineH = fontSize * 1.2;
+    // Use the block's actual rendered height for the number's box, so the
+    // number sits at the top of the wrapped block instead of squashing
+    // into one line-height's worth of space.
+    const h = rect.height || lineH;
 
-    // Count visual lines by actual block height, with a minimum of 1
-    // Use Math.round with a tolerance to avoid off-by-one at large font sizes
-    const blockH = block.getBoundingClientRect().height;
-    const blockLines = Math.max(1, Math.round(blockH / lineH));
-
-    const isCode = isCodeMode || looksLikeCode(block.innerText || '');
-    const isActive = block === currentBlock;
+    const isCode = isCodeMode || blockHasContent(target);
     const el = document.createElement('div');
     el.className = 'gutter-line' + (isCode ? ' is-code' : '') + (isActive ? ' active-line' : '');
     el.style.top = top + 'px';
-    el.style.height = lineH + 'px';
+    el.style.height = h + 'px';
     el.innerHTML = `<span class="gutter-num">${lineNum}</span>`;
     gutter.appendChild(el);
+    // Advance by exactly 1 — every block here is one real source line
+    // (we split pasted content per-line earlier), so a line that visually
+    // WRAPS across multiple rows should still only consume ONE number,
+    // the same way VS Code numbers by source line, not by rendered row.
+    // The old code advanced by the wrapped row count instead, which is
+    // what made subsequent numbers (9, 10, 13…) appear to vanish — they
+    // were being silently skipped, not actually hidden.
+    lineNum += 1;
+  }
 
-    lineNum += blockLines;
+  // Numbers every <li> in a list, in order — and recurses into any
+  // nested <ul>/<ol> so sub-lists get numbered too, instead of being
+  // skipped or collapsed into their parent line.
+  function walkListItems(listEl, activeLi) {
+    Array.from(listEl.children).forEach(li => {
+      if (li.tagName !== 'LI') return;
+      addGutterLine(li, li === activeLi);
+      Array.from(li.children).forEach(child => {
+        if (child.tagName === 'UL' || child.tagName === 'OL') {
+          const nestedActiveLi = getCaretLi(child);
+          walkListItems(child, nestedActiveLi);
+        }
+      });
+    });
+  }
+
+  blocks.forEach(block => {
+    if (block.tagName === 'UL' || block.tagName === 'OL') {
+      const activeLi = (block === currentBlock) ? getCaretLi(block) : null;
+      walkListItems(block, activeLi);
+      return;
+    }
+    addGutterLine(block, block === currentBlock);
   });
 }
 
@@ -555,6 +696,7 @@ function switchDoc(id) {
   const doc = getDoc(id);
   if (!doc) return;
   editor.innerHTML = doc.content;
+  attachImageBehaviors();
   savedDot.classList.remove('unsaved');
   savedLabel.textContent = i18n[currentLang].saved;
   hasUnsavedChanges = false;
@@ -618,11 +760,9 @@ function safeSurround(tagName, attrs) {
 }
 
 $('btn-mark').addEventListener('click', () => safeSurround('mark'));
-$('btn-ul').addEventListener('click', () => cmd('insertUnorderedList'));
-$('btn-ol').addEventListener('click', () => cmd('insertOrderedList'));
+$('btn-ul').addEventListener('click', () => { cmd('insertUnorderedList'); normalizeLists(); });
+$('btn-ol').addEventListener('click', () => { cmd('insertOrderedList'); normalizeLists(); });
 $('btn-quote').addEventListener('click', () => cmd('formatBlock', 'blockquote'));
-$('btn-hr').addEventListener('click', () => cmd('insertHorizontalRule'));
-$('btn-code').addEventListener('click', () => { if (!window.getSelection().isCollapsed) safeSurround('code'); });
 $('btn-undo').addEventListener('click', () => cmd('undo'));
 $('btn-redo').addEventListener('click', () => cmd('redo'));
 
@@ -854,6 +994,7 @@ $('image-url-input').addEventListener('keydown', e => {
 function makeResizeHandle(img, corner) {
   const handle = document.createElement('div');
   handle.className = `img-resize-handle ${corner}`;
+  handle.draggable = false; // never let a resize handle start a drag-move
   handle.title = 'Drag to resize';
 
   handle.addEventListener('mousedown', e => {
@@ -886,10 +1027,79 @@ function makeResizeHandle(img, corner) {
   return handle;
 }
 
+// ── IMAGE DRAG-TO-REPOSITION ──
+let draggedImgWrapper = null;
+let dropIndicator = null;
+
+function ensureDropIndicator() {
+  if (!dropIndicator) {
+    dropIndicator = document.createElement('div');
+    dropIndicator.id = 'img-drop-indicator';
+  }
+  return dropIndicator;
+}
+
+function makeImageDraggable(wrapper) {
+  wrapper.draggable = true;
+  wrapper.addEventListener('dragstart', e => {
+    draggedImgWrapper = wrapper;
+    wrapper.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', '');
+  });
+  wrapper.addEventListener('dragend', () => {
+    wrapper.classList.remove('dragging');
+    draggedImgWrapper = null;
+    if (dropIndicator && dropIndicator.parentNode) dropIndicator.parentNode.removeChild(dropIndicator);
+  });
+}
+
+editor.addEventListener('dragover', e => {
+  if (!draggedImgWrapper) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const blocks = Array.from(editor.children).filter(b => b !== draggedImgWrapper && b.id !== 'img-drop-indicator');
+  let target = null, placeBefore = true;
+  for (const block of blocks) {
+    const r = block.getBoundingClientRect();
+    if (e.clientY < r.top + r.height / 2) { target = block; placeBefore = true; break; }
+    target = block; placeBefore = false;
+  }
+  const indicator = ensureDropIndicator();
+  if (target) editor.insertBefore(indicator, placeBefore ? target : target.nextSibling);
+  else editor.appendChild(indicator);
+});
+
+editor.addEventListener('drop', e => {
+  if (!draggedImgWrapper) return;
+  e.preventDefault();
+  if (dropIndicator && dropIndicator.parentNode) {
+    dropIndicator.parentNode.insertBefore(draggedImgWrapper, dropIndicator);
+    dropIndicator.parentNode.removeChild(dropIndicator);
+  }
+  markUnsaved();
+  scheduleGutterUpdate();
+});
+
+// Re-attach behaviors to images loaded from a saved document (event
+// listeners don't survive being saved/reloaded as innerHTML).
+function attachImageBehaviors() {
+  editor.querySelectorAll('.img-wrapper').forEach(wrapper => {
+    if (wrapper.dataset.behaviorsAttached) return;
+    wrapper.dataset.behaviorsAttached = '1';
+    const img = wrapper.querySelector('img');
+    if (!img) return;
+    wrapper.querySelectorAll('.img-resize-handle').forEach(h => h.remove());
+    ['nw','ne','sw','se'].forEach(corner => wrapper.appendChild(makeResizeHandle(img, corner)));
+    makeImageDraggable(wrapper);
+  });
+}
+
 function doInsertImage(src) {
   const wrapper = document.createElement('div');
   wrapper.className = 'img-wrapper';
   wrapper.contentEditable = 'false';
+  wrapper.dataset.behaviorsAttached = '1';
 
   const img = document.createElement('img');
   img.src = src;
@@ -902,34 +1112,69 @@ function doInsertImage(src) {
   ['nw','ne','sw','se'].forEach(corner => {
     wrapper.appendChild(makeResizeHandle(img, corner));
   });
+  // Let the image be dragged to reposition it among the lines
+  makeImageDraggable(wrapper);
 
   editor.focus();
   if (imageInsertRange) {
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(imageInsertRange);
-    const range = sel.getRangeAt(0);
-    range.deleteContents();
-    range.insertNode(wrapper);
-    range.setStartAfter(wrapper);
-    range.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(range);
-  } else {
-    editor.appendChild(wrapper);
   }
+
+  // Force the image onto its own clean top-level line — split the current
+  // block at the cursor (like pressing Enter) so the image can never end up
+  // merged inline inside an existing text line, which is what was making
+  // its gutter number disappear and throwing off the numbers after it.
+  document.execCommand('insertParagraph');
+  const sel = window.getSelection();
+  const range = sel.getRangeAt(0);
+  range.deleteContents();
+  range.insertNode(wrapper);
+  range.setStartAfter(wrapper);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  document.execCommand('insertParagraph'); // fresh line for the cursor after the image
+
+  // Images load asynchronously — recheck the gutter once real height is known
+  img.addEventListener('load', scheduleGutterUpdate);
 
   markUnsaved();
   scheduleGutterUpdate();
 }
 
 // ── CODE MODE ──
-$('btn-codemode').addEventListener('click', () => {
-  isCodeMode = !isCodeMode;
+function setCodeMode(active) {
+  if (isCodeMode === active) return;
+  isCodeMode = active;
   document.body.classList.toggle('code-mode', isCodeMode);
   $('btn-codemode').classList.toggle('active', isCodeMode);
   $('code-mode-badge').classList.toggle('visible', isCodeMode);
-});
+  scheduleGutterUpdate();
+}
+
+$('btn-codemode').addEventListener('click', () => setCodeMode(!isCodeMode));
+
+// ── AUTOMATIC CODE MODE DETECTION ──
+let codeModeAutoTimer = null;
+function scheduleAutoCodeModeCheck() {
+  clearTimeout(codeModeAutoTimer);
+  codeModeAutoTimer = setTimeout(runAutoCodeModeCheck, 250);
+}
+
+function runAutoCodeModeCheck() {
+  // Sample the last few lines around where you're typing to decide if
+  // you're currently writing code or normal prose, and flip Code Mode
+  // to match automatically.
+  const blocks = Array.from(editor.children).filter(
+    b => !(b.classList && b.classList.contains('img-wrapper'))
+  );
+  if (blocks.length === 0) return;
+  const sampleBlocks = blocks.slice(-5); // last 5 lines
+  const text = sampleBlocks.map(b => b.innerText || '').join('\n');
+  setCodeMode(textLooksLikeCode(text));
+}
 
 // ── OPEN FILE (legacy input fallback) ──
 $('open-file-input').addEventListener('change', function() {
@@ -1017,7 +1262,32 @@ editor.addEventListener('paste', e => {
     tmp.innerHTML = html;
     text = tmp.innerText || tmp.textContent || '';
   }
-  document.execCommand('insertText', false, text);
+  if (!text) return;
+
+  // Decide immediately, from the pasted content itself, whether to
+  // switch into (or out of) Code Mode — no need to wait for the debounced
+  // typing check below when we already have the full pasted text.
+  setCodeMode(textLooksLikeCode(text));
+
+  // Make sure we're inserting into a real block element first — if the
+  // editor is empty, the first pasted line can otherwise land as a bare
+  // text node, which the gutter (it only counts editor.children) ignores.
+  if (editor.children.length === 0) {
+    document.execCommand('formatBlock', false, 'div');
+  }
+
+  // Split into individual lines and insert each one followed by a real
+  // paragraph break (like pressing Enter after each line). This gives
+  // every pasted line its own block element, so updateGutter()'s
+  // one-block-per-line-number counting lines up correctly — 1st line = 1,
+  // 2nd line = 2, etc. — matching how VS Code numbers pasted code.
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  lines.forEach((line, i) => {
+    document.execCommand('insertText', false, line);
+    if (i < lines.length - 1) {
+      document.execCommand('insertParagraph');
+    }
+  });
 });
 
 // ── TAB KEY ──
@@ -1030,8 +1300,7 @@ editor.addEventListener('keydown', e => {
 });
 
 // ── EDITOR EVENTS ──
-editor.addEventListener('input', () => { updateStats(); markUnsaved(); scheduleGutterUpdate(); });
-editor.addEventListener('paste', () => setTimeout(() => { updateStats(); scheduleGutterUpdate(); }, 100));
+editor.addEventListener('input', () => { updateStats(); markUnsaved(); scheduleGutterUpdate(); scheduleAutoCodeModeCheck(); hasUnsavedChanges = true; });
 
 // ── KEYBOARD SHORTCUTS ──
 document.addEventListener('keydown', e => {
@@ -1159,9 +1428,6 @@ $('find-replace-all').addEventListener('click', () => {
   markUnsaved();
 });
 
-// ── UNSAVED CHANGES WARNING (beforeunload) ──
-editor.addEventListener('input', () => { hasUnsavedChanges = true; });
-
 window.addEventListener('beforeunload', e => {
   if (!hasUnsavedChanges) return;
   const msg = 'Prose — You have unsaved changes. Your edits will be lost if you close this tab.';
@@ -1193,19 +1459,19 @@ window.addEventListener('beforeunload', e => {
     overflowBtn.style.display = 'none';
     drawer.classList.remove('open');
 
-    // Check if toolbar is overflowing
-    const tbWidth = toolbar.clientWidth;
-    let childrenWidth = 0;
-    Array.from(toolbar.children).forEach(c => {
-      if (c !== overflowBtn && c !== drawer) childrenWidth += c.offsetWidth + 2;
-    });
+    // Use scrollWidth vs clientWidth — the real, exact overflow measurement
+    // (immune to zoom-level rounding errors, unlike manually summing offsetWidths)
+    const isOverflowing = () => toolbar.scrollWidth > toolbar.clientWidth + 1;
 
-    if (childrenWidth > tbWidth - 10) {
-      // Move right-side candidates to drawer
-      overflowCandidates.forEach(el => {
-        if (el) drawer.appendChild(el);
-      });
+    if (isOverflowing()) {
       overflowBtn.style.display = 'flex';
+      // Move candidates into the drawer one at a time, rechecking after each
+      // move so we always reserve room for the ⋯ button itself
+      for (const el of overflowCandidates) {
+        if (!el) continue;
+        if (!isOverflowing()) break;
+        drawer.appendChild(el);
+      }
     }
   }
 
@@ -1219,6 +1485,10 @@ window.addEventListener('beforeunload', e => {
   });
 
   window.addEventListener('resize', checkOverflow);
+  // Zoom changes don't always fire a clean 'resize' event in every browser,
+  // so also watch the toolbar's own box directly.
+  const toolbarResizeObserver = new ResizeObserver(() => checkOverflow());
+  toolbarResizeObserver.observe(toolbar);
   // Run after fonts load
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(checkOverflow);
