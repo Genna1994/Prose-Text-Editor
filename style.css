@@ -550,9 +550,10 @@ body {
   color: var(--ink-faint);
   line-height: 1;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: flex-end;
   padding-right: 10px;
+  padding-top: 2px;
   cursor: default;
   transition: color 0.12s, background 0.12s;
   border-radius: 2px 0 0 2px;
@@ -601,12 +602,28 @@ body {
 }
 
 [dir="rtl"] #paper { border-left: none; border-right: none; }
-body.code-mode #paper { }
+body.code-mode #paper {
+  overflow-x: auto;
+  overflow-y: visible;
+}
 body.code-mode #editor {
   font-family: var(--font-fira);
   font-size: 14px;
   tab-size: 4;
+  /* Stop wrapping — a long line stays on ONE row, exactly like VS Code,
+     instead of breaking across multiple visual rows. */
+  white-space: pre;
+  word-wrap: normal;
+  overflow-wrap: normal;
+  /* Let the editor grow as wide as its longest line so overflow-x on
+     #paper actually has something to scroll. */
+  width: max-content;
+  min-width: 100%;
 }
+/* Give the horizontal scrollbar the same thin styling as the vertical one */
+body.code-mode #paper::-webkit-scrollbar { height: 6px; }
+body.code-mode #paper::-webkit-scrollbar-track { background: transparent; }
+body.code-mode #paper::-webkit-scrollbar-thumb { background: var(--ink-faint); border-radius: 3px; }
 
 #editor {
   width: 100%;
@@ -681,6 +698,7 @@ body.code-mode #editor {
 
 /* 4-corner resize handles */
 .img-resize-handle {
+  
   position: absolute;
   width: 12px;
   height: 12px;
@@ -695,6 +713,16 @@ body.code-mode #editor {
 .img-resize-handle.sw { bottom: 2px; left: 2px; cursor: sw-resize; border-radius: 0 3px 0 3px; }
 .img-resize-handle.ne { top: 2px; right: 2px; cursor: ne-resize; border-radius: 0 3px 0 3px; }
 .img-resize-handle.nw { top: 2px; left: 2px; cursor: nw-resize; border-radius: 3px 0 3px 0; }
+
+.img-wrapper { cursor: grab; }
+.img-wrapper.dragging { opacity: 0.35; }
+#img-drop-indicator {
+  height: 3px;
+  background: var(--accent);
+  border-radius: 2px;
+  margin: 6px 0;
+  pointer-events: none;
+}
 
 /* Search highlights */
 mark.find-highlight { background: rgba(196,98,45,0.25); border-radius: 2px; color: inherit; padding: 0; }
